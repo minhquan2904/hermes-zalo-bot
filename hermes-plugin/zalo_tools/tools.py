@@ -16,6 +16,8 @@ nhóm) hoặc chạm tới tiền bạc cố tình bị bỏ ra ngoài.
 
 import asyncio
 import contextvars
+import errno
+import http.client
 import hashlib
 import json
 import logging
@@ -27,6 +29,10 @@ import threading
 import time
 import unicodedata
 import subprocess
+import socket
+import sys
+import urllib.error
+import urllib.request
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -1675,9 +1681,11 @@ async def zalo_web_read(args: Dict[str, Any], **_kw) -> str:
 #    đi qua `_is_public_url`: cổng đó tồn tại để chặn URL do người gọi đưa vào,
 #    còn ở đây người gọi không chọn được đích. Đưa endpoint vào schema sẽ biến
 #    đúng tool này thành lỗ SSRF mà `_is_public_url` đang bịt.
-# 2. Laya KHÔNG có xác thực. Bất cứ thứ gì tới được địa chỉ đó đều gọi được nó.
-#    Nên tool này giới hạn kích thước và đặt timeout ngắn — để bot không bị dùng
-#    làm máy tạo tải nhắm vào một service không tự bảo vệ được.
+# 2. Laya đòi Bearer token trung tâm, đọc theo scope của hồ sơ, không từ `args`.
+#    Token chỉ đi qua https và không bao giờ theo redirect: 3xx được coi là
+#    lỗi, để header không bị gửi lại sang host khác. Không log URL hay token.
+#    Token đó dùng chung, nên tool vẫn giới hạn kích thước và đặt timeout —
+#    để bot không bị dùng làm máy tạo tải nhắm vào Laya.
 # 3. Laya ghi lại NGUYÊN VĂN mọi request và response của `/predict` vào thư mục
 #    collector trên host của nó, ngoài biên dữ liệu mà repo này kiểm soát, và
 #    không có chính sách retention. Những gì người dùng gõ vào đây sẽ rời đi.
@@ -1705,26 +1713,158 @@ _VIETNAMESE_LETTERS = re.compile(
 )
 
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *_args, **_kwargs):
+        return None
+
+
+class _LayaDeadline:
+    """Abort tracked sockets at the deadline, after TCP connection is established.
+
+    DNS resolution and socket creation may exceed the budget before tracking begins.
+    """
+
+    def __init__(self, timeout: float):
+        self._lock = threading.Lock()
+        self._socket = None
+        self._expired = False
+        self._timer = threading.Timer(timeout, self._expire)
+        self._timer.daemon = True
+
+    def start(self):
+        self._timer.start()
+
+    def track(self, sock):
+        with self._lock:
+            self._socket = sock
+            if self._expired:
+                self._shutdown()
+
+    def _shutdown(self):
+        if self._socket is not None:
+            try:
+                self._socket.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+
+    def _expire(self):
+        with self._lock:
+            self._expired = True
+            self._shutdown()
+
+    def finish(self):
+        self._timer.cancel()
+        with self._lock:
+            expired = self._expired
+            self._socket = None
+        if expired:
+            raise TimeoutError("Laya request deadline exceeded")
+
+
+_LAYA_ACTIVE = threading.local()
+
+
+def _laya_connect(conn):
+    """Mirror HTTPConnection.connect, tracking TCP before any proxy tunnel."""
+    sys.audit("http.client.connect", conn, conn.host, conn.port)
+    conn.sock = conn._create_connection(
+        (conn.host, conn.port), conn.timeout, conn.source_address)
+    try:
+        conn.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    except OSError as exc:
+        if exc.errno != errno.ENOPROTOOPT:
+            raise
+    _LAYA_ACTIVE.deadline.track(conn.sock)
+    if conn._tunnel_host:
+        conn._tunnel()
+
+
+class _LayaHTTPConnection(http.client.HTTPConnection):
+    def connect(self):
+        _laya_connect(self)
+
+
+class _LayaHTTPSConnection(http.client.HTTPSConnection):
+    def connect(self):
+        _laya_connect(self)
+        deadline = _LAYA_ACTIVE.deadline
+        host = self._tunnel_host or self.host
+        self.sock = self._context.wrap_socket(
+            self.sock, server_hostname=host, do_handshake_on_connect=False)
+        deadline.track(self.sock)
+        self.sock.do_handshake()
+
+
+class _LayaHTTPHandler(urllib.request.HTTPHandler):
+    def http_open(self, req):
+        return self.do_open(_LayaHTTPConnection, req)
+
+
+class _LayaHTTPSHandler(urllib.request.HTTPSHandler):
+    def https_open(self, req):
+        return self.do_open(_LayaHTTPSConnection, req, context=self._context)
+
+
+_LAYA_OPENER = urllib.request.build_opener(_NoRedirect, _LayaHTTPHandler, _LayaHTTPSHandler)
+LAYA_RESPONSE_MAX_BYTES = 1024 * 1024
+
+
+def _laya_secret(name: str) -> str:
+    from agent.secret_scope import UnscopedSecretError, get_secret
+    try:
+        return str(get_secret(name, "") or "").strip()
+    except UnscopedSecretError:
+        # Không rõ scope: không gắn địa chỉ hay token của hồ sơ khác.
+        return ""
+
+
 def _laya_base() -> str:
-    return os.environ.get("LAYA_BASE_URL", "").strip().rstrip("/")
+    return _laya_secret("LAYA_BASE_URL").rstrip("/")
 
 
-def _laya_call(base: str, payload: Dict[str, Any]) -> tuple[int, Any]:
-    """Gọi `/predict` và trả về (http_status, body đã parse nếu là JSON)."""
-    import urllib.error
-    import urllib.request
+def _laya_token() -> str:
+    return _laya_secret("LAYA_ACCESS_TOKEN")
 
+
+def _laya_ready() -> tuple[str, str]:
+    base, token = _laya_base(), _laya_token()
+    if not base.startswith("https://") or not token:
+        return "", ""
+    return base, token
+
+
+def _laya_call(base: str, token: str, payload: Dict[str, Any], *,
+               timeout: float) -> tuple[int, Any]:
+    """Gọi `/predict` và trả về (http_status, body đã parse nếu là JSON).
+
+    Token do phía gọi đọc sẵn qua `_laya_ready()`: hàm này chạy trong luồng
+    worker, nơi scope bí mật của hồ sơ không còn.
+    """
+    headers = {"Content-Type": "application/json"}
+    # Token chỉ đi qua https; gọi trực tiếp bằng địa chỉ cleartext thì không gắn.
+    if token and base.startswith("https://"):
+        headers["Authorization"] = f"Bearer {token}"
     request = urllib.request.Request(
         base + "/predict",
         data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
+        headers=headers,
         method="POST",
     )
+    deadline = _LayaDeadline(timeout)
+    _LAYA_ACTIVE.deadline = deadline
+    deadline.start()
     try:
-        with urllib.request.urlopen(request, timeout=LAYA_TIMEOUT_SECONDS) as response:
-            status, raw = response.status, response.read()
-    except urllib.error.HTTPError as exc:
-        status, raw = exc.code, exc.read()
+        try:
+            with _LAYA_OPENER.open(request, timeout=timeout) as response:
+                status, raw = response.status, response.read(LAYA_RESPONSE_MAX_BYTES + 1)
+        except urllib.error.HTTPError as exc:
+            with exc:
+                status, raw = exc.code, exc.read(LAYA_RESPONSE_MAX_BYTES + 1)
+    finally:
+        del _LAYA_ACTIVE.deadline
+        deadline.finish()
+    if len(raw) > LAYA_RESPONSE_MAX_BYTES:
+        raise ValueError("Laya response too large")
     try:
         return status, json.loads(raw.decode("utf-8", "replace"))
     except (ValueError, UnicodeDecodeError):
@@ -1766,7 +1906,7 @@ def _laya_question(name: str, spec: Any) -> tuple[Optional[Dict[str, Any]], Opti
 
 
 async def zalo_laya_route(args: Dict[str, Any], **_kw) -> str:
-    base = _laya_base()
+    base, token = _laya_ready()
     if not base:
         # Không nói địa chỉ, không nói tên biến: người gọi không sửa được điều
         # này, và một thông báo cấu hình là một mẩu thông tin nội bộ.
@@ -1809,7 +1949,8 @@ async def zalo_laya_route(args: Dict[str, Any], **_kw) -> str:
         payload["lang"] = "vi"
 
     try:
-        status, body = await asyncio.to_thread(_laya_call, base, payload)
+        status, body = await asyncio.to_thread(
+            _laya_call, base, token, payload, timeout=LAYA_TIMEOUT_SECONDS)
     except Exception as exc:
         # Chỉ tên lớp lỗi. Chuỗi lỗi của urllib có kèm địa chỉ đích.
         logger.warning("[laya] gọi /predict hỏng: %s", type(exc).__name__)
