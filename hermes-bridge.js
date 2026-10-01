@@ -10,7 +10,7 @@ import { classifyAttachments } from './zalo-attachments.js';
 import { pickSmartReaction } from './smart-reaction.js';
 import { RateLimiter, RateLimitedError, THROTTLED_METHODS } from './rate-limiter.js';
 import { openZaloStore } from './zalo-store.js';
-import { authorizeBridgeCommand } from './zalo-policy.js';
+import { ZALO_POLICY_METHODS, authorizeBridgeCommand, threadArgIndex } from './zalo-policy.js';
 
 /**
  * Cầu nối Zalo ↔ Hermes Agent.
@@ -760,13 +760,7 @@ function policyErrorMessage(code) {
 
 function auditTargetSummary(cmd) {
   const args = Array.isArray(cmd.args) ? cmd.args : [];
-  const targetIndexes = {
-    sendMessage: 1, sendVoice: 1, sendSticker: 1, sendLink: 1,
-    uploadAttachment: 1, createReminder: 1, removeReminder: 1,
-    changeGroupName: 1, addUserToGroup: 1,
-    removeUserFromGroup: 1, addGroupDeputy: 1, removeGroupDeputy: 1,
-  };
-  const invokeIndex = targetIndexes[String(cmd.method || '')];
+  const invokeIndex = threadArgIndex(cmd.method);
   const invokeThreadId = invokeIndex == null ? undefined : args[invokeIndex];
   const summary = {
     commandType: String(cmd.type || ''),
@@ -798,7 +792,13 @@ async function handleCommand(ws, cmd) {
     return;
   }
   const authorization = authorizeBridgeCommand(cmd, { ownerUids: activeOwnerUids });
-  const shouldAudit = ['send', 'admin', 'undo'].includes(authorization.category);
+  // Ghi audit cho mọi lệnh có tác dụng ngoài, mọi lệnh bị từ chối, và mọi lần
+  // đọc chỉ-chủ-nhân (history_range, OWNER_READ): đó là những chỗ cần lần lại
+  // khi nghi bot bị dụ. Audit chỉ giữ tóm tắt đích, không giữ nội dung.
+  const shouldAudit = ['send', 'admin', 'undo'].includes(authorization.category)
+    || !authorization.allowed
+    || cmd.type === 'history_range'
+    || (cmd.type === 'invoke' && ZALO_POLICY_METHODS.ownerRead.has(String(cmd.method || '')));
   const auditRequestId = String(cmd.reqId || `bridge-${Date.now()}-${Math.random().toString(16).slice(2)}`);
   let auditFinished = false;
   const finishAudit = (status, error = null) => {

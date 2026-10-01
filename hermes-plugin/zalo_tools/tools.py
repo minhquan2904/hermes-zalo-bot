@@ -149,6 +149,18 @@ def _current_thread() -> Optional[str]:
 def _current_thread_kind() -> str:
     return "group" if _turn().get("is_group") else "dm"
 
+
+def _owner_dm(turn: Optional[Dict[str, Any]] = None) -> bool:
+    """Chủ nhân đang nhắn riêng — lượt duy nhất giữ quyền tham số của chủ.
+
+    Trong nhóm, bot đọc chữ của người khác (lịch sử, tin được reply, tệp đính
+    kèm) ngay trong lượt của chủ nhân, nên chữ đó có thể dụ bot gửi tin hay tệp
+    sang nơi khác. Vì vậy chủ nhân ngoài DM đi chung đường với mọi người: chỉ
+    chính hội thoại này, chỉ tệp trong kho tài liệu.
+    """
+    turn = _turn() if turn is None else turn
+    return bool(turn.get("is_owner")) and not turn.get("is_group")
+
 # Adapter đang sống tự ghi tên mình vào đây khi kết nối, để các công cụ tìm
 # được đường ra cầu nối. Công cụ được đăng ký lúc nạp plugin, còn adapter thì
 # mãi sau mới dựng — nên không truyền thẳng tham chiếu được.
@@ -335,8 +347,8 @@ def _scoped_thread(args: Dict[str, Any], key: str = "thread_id") -> tuple:
     asked = str(args.get(key) or "").strip()
     current = _current_thread()
 
-    if turn.get("is_owner"):
-        # Chủ nhân được nhắm tới hội thoại bất kỳ.
+    if _owner_dm(turn):
+        # Chủ nhân nhắn riêng được nhắm tới hội thoại bất kỳ.
         target = asked or current
         if not target:
             return None, None, _err(f"cần `{key}`")
@@ -404,10 +416,10 @@ async def zalo_send_file(args: Dict[str, Any], **_kw) -> str:
     # đi thẳng lên máy chủ Zalo.
     #
     # Nên người ngoài chỉ gửi được tệp NẰM TRONG kho tài liệu — đúng phạm vi
-    # mà zalo_kb_read đã mở, không rộng thêm một tấc nào. Chủ nhân giữ nguyên
-    # quyền gửi tệp bất kỳ.
+    # mà zalo_kb_read đã mở, không rộng thêm một tấc nào. Chủ nhân nhắn riêng
+    # giữ quyền gửi tệp bất kỳ; trong nhóm thì như mọi người.
     turn = _turn()
-    if turn and not turn.get("is_owner"):
+    if turn and not _owner_dm(turn):
         root = _kb_root()
         if root is None:
             return _err("chưa cấu hình kho tài liệu nên chưa gửi tệp được")
@@ -508,7 +520,7 @@ async def zalo_send_voice(args: Dict[str, Any], **_kw) -> str:
         return err
     if os.path.isfile(url):
         turn = _turn()
-        if not turn.get("is_owner"):
+        if not _owner_dm(turn):
             root = _kb_root()
             target = _kb_resolve(root, url) if root is not None else None
             if target is None or not target.is_file():
@@ -528,7 +540,7 @@ async def zalo_send_voice(args: Dict[str, Any], **_kw) -> str:
         return _ok({"message_id": result.message_id})
     # Với URL, sidecar tự gửi yêu cầu HEAD tới địa chỉ đó từ máy chủ. Người
     # ngoài mà truyền địa chỉ nội bộ là dò được mạng LAN/localhost.
-    if not _turn().get("is_owner") and not _is_public_url(url):
+    if not _owner_dm() and not _is_public_url(url):
         return _err("chỉ gửi được voice từ địa chỉ web công cộng (http/https)")
     return await _invoke("sendVoice", [
         {"voiceUrl": url, "ttl": args.get("ttl", 0)}, thread_id, _thread_type(kind),
@@ -887,19 +899,53 @@ async def zalo_create_note(args: Dict[str, Any], **_kw) -> str:
     }, group_id])
 
 
+def _reminder_start(args: Dict[str, Any]) -> tuple[Optional[datetime], Optional[str]]:
+    """Đổi `time` (giờ địa phương, người đọc được) hoặc `start_time` (ms) thành datetime.
+
+    Model tự tính epoch thì sai: lượt 23/09 nó đặt 1790188200000 — 01:30 sáng —
+    rồi báo nhóm là "15:13". Giờ địa phương là TZ của container.
+    """
+    raw = str(args.get("time") or "").strip()
+    if raw:
+        for fmt in ("%Y-%m-%d %H:%M", "%Y-%m-%dT%H:%M", "%d/%m/%Y %H:%M"):
+            try:
+                return datetime.strptime(raw, fmt).astimezone(), None
+            except ValueError:
+                continue
+        return None, "`time` phải có dạng 'YYYY-MM-DD HH:MM' theo giờ Việt Nam"
+    if args.get("start_time") is not None:
+        try:
+            return datetime.fromtimestamp(int(args["start_time"]) / 1000).astimezone(), None
+        except (TypeError, ValueError, OverflowError, OSError):
+            return None, "`start_time` phải là mili giây kể từ epoch"
+    return None, "cần `time` dạng 'YYYY-MM-DD HH:MM' (giờ Việt Nam)"
+
+
 async def zalo_create_reminder(args: Dict[str, Any], **_kw) -> str:
     title = (args.get("title") or "").strip()
-    start_time = args.get("start_time")
-    if not title or start_time is None:
-        return _err("cần `title` và `start_time` (mốc thời gian tính bằng mili giây)")
+    if not title:
+        return _err("cần `title`")
+    start, problem = _reminder_start(args)
+    if problem:
+        return _err(problem)
+    if start <= datetime.now().astimezone():
+        return _err(f"thời điểm {start:%H:%M %d/%m/%Y} đã qua — chọn một giờ trong tương lai")
     thread_id, kind, err = _scoped_thread(args)
     if err:
         return err
-    return await _invoke("createReminder", [{
+    out = await _invoke("createReminder", [{
         "title": title,
-        "startTime": int(start_time),
+        "startTime": int(start.timestamp() * 1000),
         "repeat": int(args.get("repeat", 0)),
     }, thread_id, _thread_type(kind)])
+    # Kèm giờ đã đặt, đọc được, để câu trả lời cho nhóm nói đúng giờ thật.
+    try:
+        body = json.loads(out)
+    except ValueError:
+        return out
+    if body.get("success"):
+        body["nhac_luc"] = f"{start:%H:%M} {start:%d/%m/%Y}"
+    return json.dumps(body, ensure_ascii=False)
 
 
 async def zalo_list_reminders(args: Dict[str, Any], **_kw) -> str:
@@ -1489,6 +1535,7 @@ def _google_export_url(raw: str) -> str:
 def _is_public_url(raw: str) -> bool:
     """Chỉ cho phép http/https trỏ ra địa chỉ công cộng."""
     import ipaddress
+    import socket
     from urllib.parse import urlparse
 
     try:
@@ -1506,9 +1553,31 @@ def _is_public_url(raw: str) -> bool:
         return False
 
     try:
-        ip = ipaddress.ip_address(host)
+        return _is_public_address(ipaddress.ip_address(host))
     except ValueError:
-        return True                       # tên miền — để tầng mạng lo tiếp
+        pass                              # không phải IP literal — nó là một cái tên
+
+    # Tên phải được phân giải rồi mới xét, chứ không "để tầng mạng lo tiếp".
+    # Tầng mạng ở đây là firewall bridge, và firewall mở đúng một địa chỉ nội bộ
+    # cho runtime gọi model với MCP. Một cái tên trỏ vào chính địa chỉ đó thì đi
+    # lọt, rồi nội dung nội bộ được dán thẳng vào hội thoại Zalo; chỉ cần một
+    # entry `extra_hosts` là cái tên ấy phân giải được bên trong container.
+    # Không liệt kê tên nội bộ ở đây: repo này công khai, và một danh sách tên
+    # cũng chỉ chặn được đúng những tên ai đó còn nhớ để viết vào.
+    try:
+        infos = socket.getaddrinfo(host, None, proto=socket.IPPROTO_TCP)
+    except OSError:
+        return False                      # không phân giải được ⇒ không cho đi
+    addresses = {info[4][0] for info in infos}
+    if not addresses:
+        return False
+    # MỌI địa chỉ phải công cộng: một tên trả cả địa chỉ công cộng lẫn địa chỉ
+    # nội bộ thì lần kết nối thật vẫn có thể rơi vào cái nội bộ.
+    return all(_is_public_address(ipaddress.ip_address(item)) for item in addresses)
+
+
+def _is_public_address(ip) -> bool:
+    """Một địa chỉ đã phân giải có nằm ngoài mọi dải dành riêng hay không."""
     return not (
         ip.is_private or ip.is_loopback or ip.is_link_local
         or ip.is_reserved or ip.is_multicast or ip.is_unspecified
@@ -1590,6 +1659,186 @@ async def zalo_web_read(args: Dict[str, Any], **_kw) -> str:
     # đúng địa chỉ người dùng đưa vào.
     urls = [_google_export_url(u) for u in urls]
     return await _core("web_extract", {"urls": urls[:5]}, attempts=2)
+
+
+# =====================================================================
+#  Nhóm 8b — Laya: bộ định tuyến ý định chạy nội bộ
+# =====================================================================
+#
+# Laya là một service HTTP nhỏ chạy CPU trên hạ tầng nội bộ. Nó KHÔNG phải model
+# sinh văn bản: đưa vào một đoạn ngữ cảnh (`state`) cùng vài câu hỏi
+# (`questions`), nó trả về lựa chọn cho từng câu hỏi kèm router nào đã quyết.
+#
+# Ba điều phải nhớ về ranh giới, vì tool này thành viên nhóm gọi được:
+#
+# 1. Endpoint đến từ biến môi trường, KHÔNG bao giờ từ `args`. Vì thế nó không
+#    đi qua `_is_public_url`: cổng đó tồn tại để chặn URL do người gọi đưa vào,
+#    còn ở đây người gọi không chọn được đích. Đưa endpoint vào schema sẽ biến
+#    đúng tool này thành lỗ SSRF mà `_is_public_url` đang bịt.
+# 2. Laya KHÔNG có xác thực. Bất cứ thứ gì tới được địa chỉ đó đều gọi được nó.
+#    Nên tool này giới hạn kích thước và đặt timeout ngắn — để bot không bị dùng
+#    làm máy tạo tải nhắm vào một service không tự bảo vệ được.
+# 3. Laya ghi lại NGUYÊN VĂN mọi request và response của `/predict` vào thư mục
+#    collector trên host của nó, ngoài biên dữ liệu mà repo này kiểm soát, và
+#    không có chính sách retention. Những gì người dùng gõ vào đây sẽ rời đi.
+
+LAYA_STATE_MAX = 4000
+LAYA_INSTRUCTIONS_MAX = 500
+LAYA_CRITERION_MAX = 200
+LAYA_CRITERIA_MAX = 20
+LAYA_QUESTIONS_MAX = 5
+LAYA_TIMEOUT_SECONDS = 60
+LAYA_MODELS = ("english", "multilingual", "typed-decisions")
+# Hình dạng duy nhất đã thấy Laya trả 200. Giữ hẹp có chủ ý: mọi biến thể khác
+# thử qua gateway đều trả 500, nên danh sách này là thứ đo được, không phải thứ
+# suy ra từ tài liệu.
+LAYA_QUESTION_TYPES = ("choice",)
+# `probabilities` luôn cộng về 1 nên lúc nào cũng có một lựa chọn "thắng", kể cả
+# khi Laya đoán mò. `confidence` mới là tín hiệu: đo trên service thật, mọi câu
+# phân loại sai đều dưới 0.4, câu đúng rõ ràng đều trên 0.9.
+LAYA_CONFIDENCE_MIN = 0.5
+# Router tự chọn đẩy câu tiếng Việt ngắn ("xin chào") sang router `english` —
+# đo được. Chữ cái có dấu riêng của tiếng Việt là đủ để nói `lang=vi`.
+_VIETNAMESE_LETTERS = re.compile(
+    "[ăâđêôơưàáạảãầấậẩẫằắặẳẵèéẹẻẽềếệểễìíịỉĩòóọỏõồốộổỗờớợởỡùúụủũừứựửữỳýỵỷỹ]",
+    re.IGNORECASE,
+)
+
+
+def _laya_base() -> str:
+    return os.environ.get("LAYA_BASE_URL", "").strip().rstrip("/")
+
+
+def _laya_call(base: str, payload: Dict[str, Any]) -> tuple[int, Any]:
+    """Gọi `/predict` và trả về (http_status, body đã parse nếu là JSON)."""
+    import urllib.error
+    import urllib.request
+
+    request = urllib.request.Request(
+        base + "/predict",
+        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=LAYA_TIMEOUT_SECONDS) as response:
+            status, raw = response.status, response.read()
+    except urllib.error.HTTPError as exc:
+        status, raw = exc.code, exc.read()
+    try:
+        return status, json.loads(raw.decode("utf-8", "replace"))
+    except (ValueError, UnicodeDecodeError):
+        return status, None
+
+
+def _laya_question(name: str, spec: Any) -> tuple[Optional[Dict[str, Any]], Optional[str]]:
+    """Kiểm một câu hỏi, trả (đã chuẩn hoá, lỗi)."""
+    if not isinstance(spec, dict):
+        return None, f"`{name}` phải là một đối tượng có `instructions` và `criteria`"
+
+    kind = str(spec.get("type") or "choice").strip()
+    if kind not in LAYA_QUESTION_TYPES:
+        return None, f"`{name}.type` phải là: {', '.join(LAYA_QUESTION_TYPES)}"
+
+    instructions = str(spec.get("instructions") or "").strip()
+    if not instructions:
+        return None, f"`{name}` cần `instructions` — câu hỏi đặt cho Laya"
+    if len(instructions) > LAYA_INSTRUCTIONS_MAX:
+        return None, f"`{name}.instructions` dài quá {LAYA_INSTRUCTIONS_MAX} ký tự"
+
+    criteria = spec.get("criteria")
+    if not isinstance(criteria, dict) or len(criteria) < 2:
+        return None, f"`{name}` cần `criteria` với ít nhất hai lựa chọn"
+    if len(criteria) > LAYA_CRITERIA_MAX:
+        return None, f"`{name}.criteria` tối đa {LAYA_CRITERIA_MAX} lựa chọn"
+
+    cleaned: Dict[str, str] = {}
+    for label, meaning in criteria.items():
+        key = str(label).strip()
+        text = str(meaning).strip() if not isinstance(meaning, (dict, list)) else ""
+        if not key or not text:
+            return None, f"mỗi lựa chọn trong `{name}.criteria` cần một nhãn và một mô tả"
+        if len(text) > LAYA_CRITERION_MAX:
+            return None, f"mô tả lựa chọn trong `{name}` dài tối đa {LAYA_CRITERION_MAX} ký tự"
+        cleaned[key] = text
+
+    return {"type": kind, "instructions": instructions, "criteria": cleaned}, None
+
+
+async def zalo_laya_route(args: Dict[str, Any], **_kw) -> str:
+    base = _laya_base()
+    if not base:
+        # Không nói địa chỉ, không nói tên biến: người gọi không sửa được điều
+        # này, và một thông báo cấu hình là một mẩu thông tin nội bộ.
+        return _err("Laya chưa sẵn sàng ở bản cài này")
+
+    state = str(args.get("state") or "").strip()
+    if not state:
+        return _err("cần `state` — đoạn ngữ cảnh để Laya đọc")
+    if len(state) > LAYA_STATE_MAX:
+        return _err(f"`state` dài quá {LAYA_STATE_MAX} ký tự")
+
+    questions = args.get("questions")
+    if not isinstance(questions, dict) or not questions:
+        return _err("cần `questions` — mỗi câu hỏi có `instructions` và `criteria`")
+    if len(questions) > LAYA_QUESTIONS_MAX:
+        return _err(f"tối đa {LAYA_QUESTIONS_MAX} câu hỏi mỗi lần")
+
+    cleaned: Dict[str, Any] = {}
+    for key, spec in questions.items():
+        name = str(key).strip()
+        if not name:
+            return _err("mỗi câu hỏi cần một tên")
+        question, problem = _laya_question(name, spec)
+        if problem:
+            return _err(problem)
+        cleaned[name] = question
+
+    # `state` đi dưới dạng object. Một chuỗi trần trả 500 — đo được, không đoán.
+    payload: Dict[str, Any] = {"state": {"body": state}, "questions": cleaned}
+    model = str(args.get("model") or "").strip()
+    if model:
+        if model not in LAYA_MODELS:
+            return _err(f"`model` phải là một trong: {', '.join(LAYA_MODELS)}")
+        payload["model"] = model
+    for key in ("task", "lang"):
+        value = str(args.get(key) or "").strip()
+        if value:
+            payload[key] = value
+    if "lang" not in payload and _VIETNAMESE_LETTERS.search(state):
+        payload["lang"] = "vi"
+
+    try:
+        status, body = await asyncio.to_thread(_laya_call, base, payload)
+    except Exception as exc:
+        # Chỉ tên lớp lỗi. Chuỗi lỗi của urllib có kèm địa chỉ đích.
+        logger.warning("[laya] gọi /predict hỏng: %s", type(exc).__name__)
+        return _err("không gọi được Laya lúc này")
+
+    if status != 200 or not isinstance(body, dict):
+        logger.warning("[laya] /predict trả HTTP %s", status)
+        return _err(f"Laya từ chối yêu cầu (HTTP {status})")
+    answers = body.get("answers")
+    unsure = []
+    if isinstance(answers, dict):
+        for name, answer in answers.items():
+            confidence = answer.get("confidence") if isinstance(answer, dict) else None
+            if isinstance(confidence, (int, float)) and not isinstance(confidence, bool):
+                answer["tin_cay_thap"] = confidence < LAYA_CONFIDENCE_MIN
+                if answer["tin_cay_thap"]:
+                    unsure.append(name)
+    # Trả phần người đọc cần, không trả cả đường dẫn kho model trong `routing`.
+    result = {
+        "tra_loi": answers,
+        "router": (body.get("routing") or {}).get("model"),
+        "ly_do_chon_router": (body.get("routing") or {}).get("reason"),
+    }
+    if unsure:
+        result["canh_bao"] = (
+            f"Laya không chắc ở: {', '.join(unsure)} (confidence < {LAYA_CONFIDENCE_MIN}). "
+            "Nói rõ là Laya không chắc; đừng đọc xác suất như một kết luận."
+        )
+    return _ok(result)
 
 
 # =====================================================================
@@ -1917,7 +2166,7 @@ VIDEO_DELIVERED: set[str] = set()
 
 def _video_turn() -> Optional[Dict[str, Any]]:
     turn = _turn()
-    return turn if (turn and turn.get("is_owner") and not turn.get("is_group")
+    return turn if (turn and _owner_dm(turn)
                     and turn.get("sender_uid") and turn.get("thread_id")) else None
 
 
@@ -2689,12 +2938,15 @@ TOOLS = [
             "thread_id": _THREAD_ID,
             "thread_kind": _THREAD_KIND,
             "title": {"type": "string", "description": "Nội dung nhắc."},
+            "time": {"type": "string", "description":
+                     "Giờ nhắc theo giờ Việt Nam, dạng 'YYYY-MM-DD HH:MM', ví dụ "
+                     "'2026-09-24 15:00'. Đừng tự tính epoch."},
             "start_time": {"type": "integer",
-                           "description": "Thời điểm nhắc, tính bằng mili giây kể từ epoch."},
+                           "description": "Cách cũ: mili giây kể từ epoch. Dùng `time` thay thế."},
             "repeat": {"type": "integer",
                        "description": "0 không lặp, 1 hằng ngày, 2 hằng tuần, 3 hằng tháng."},
         },
-        ["thread_id", "title", "start_time"],
+        ["thread_id", "title"],
     ), zalo_create_reminder, TOOLSET_PUBLIC),
 
     ("zalo_list_reminders", "🔔", _schema(
@@ -2913,6 +3165,44 @@ TOOLS = [
         },
         [],
     ), zalo_web_read, TOOLSET_PUBLIC),
+
+    # --- Nhóm 8b: Laya, bộ định tuyến ý định nội bộ ---
+    ("zalo_laya_route", "🧭", _schema(
+        "zalo_laya_route",
+        "Hỏi Laya — bộ phân loại chạy nội bộ — xem một đoạn ngữ cảnh rơi vào "
+        "lựa chọn nào. Không sinh văn bản: mỗi câu hỏi nhận lại một lựa chọn "
+        "kèm xác suất và độ tin cậy. Dùng để phân loại, định tuyến, gắn nhãn. "
+        "Câu trả lời có `tin_cay_thap: true` nghĩa là Laya đoán mò — nói rõ là "
+        "không chắc, đừng báo lựa chọn đó như kết quả. Nếu tool báo lỗi đầu vào, "
+        "báo lại lỗi cho người dùng; đừng tự sửa câu hỏi rồi gọi lại.",
+        {
+            "state": {"type": "string", "description":
+                      "Đoạn ngữ cảnh Laya đọc, tối đa 4000 ký tự."},
+            "questions": {
+                "type": "object",
+                "description":
+                    "Tối đa 5 câu hỏi. Mỗi câu là một object: `instructions` là "
+                    "câu hỏi, `criteria` là các lựa chọn dạng {nhãn: mô tả}, ít "
+                    "nhất hai lựa chọn.",
+                "additionalProperties": {
+                    "type": "object",
+                    "properties": {
+                        "type": {"type": "string", "enum": list(LAYA_QUESTION_TYPES)},
+                        "instructions": {"type": "string"},
+                        "criteria": {"type": "object",
+                                     "additionalProperties": {"type": "string"}},
+                    },
+                    "required": ["instructions", "criteria"],
+                },
+            },
+            "model": {"type": "string", "enum": list(LAYA_MODELS), "description":
+                      "Router chỉ định. Bỏ trống để Laya tự chọn theo ngôn ngữ."},
+            "lang": {"type": "string", "description":
+                     "Mã ngôn ngữ, ví dụ 'vi'. Bỏ trống để Laya tự đoán."},
+            "task": {"type": "string", "description": "Tên tác vụ, tuỳ chọn."},
+        },
+        ["state", "questions"],
+    ), zalo_laya_route, TOOLSET_PUBLIC),
 
     # --- Nhóm 9: sổ hồ sơ người quen ---
     ("zalo_remember_person", "🧠", _schema(
@@ -3209,6 +3499,45 @@ def _resolved_tool_name(name: str, args: Any) -> Optional[str]:
     return str(underlying)
 
 
+def _tool_call_problem(args: Any) -> Optional[str]:
+    """Lỗi hình dạng mà chính Hermes báo cho một tool_call, hoặc None."""
+    try:
+        from tools.tool_search import resolve_underlying_call
+
+        _name, _args, error = resolve_underlying_call(args if isinstance(args, dict) else {})
+    except Exception:
+        return None
+    return str(error) if error else None
+
+
+# Công cụ của chủ nhân mà lượt của chủ nhân TRONG NHÓM vẫn gọi được, miễn là chỉ
+# nhắm vào chính nhóm đó. Nhóm alert không ai gọi bot, nên "tổng hợp alert hôm
+# nay" chỉ có đường là chủ nhân tag bot trong nhóm rồi đọc lại lịch sử nhóm ấy.
+_OWNER_GROUP_SAME_THREAD_TOOLS = frozenset({"zalo_read_history"})
+
+
+def _owner_group_may_call(turn: Dict[str, Any], name: str, args: Any) -> bool:
+    if not (turn.get("is_owner") and turn.get("is_group")):
+        return False
+    if turn.get("cron_job_id") or _outsider_spoke_after(turn):
+        return False
+    underlying, call_args = name, args
+    if name == "tool_call":
+        try:
+            from tools.tool_search import resolve_underlying_call
+
+            underlying, call_args, error = resolve_underlying_call(args if isinstance(args, dict) else {})
+        except Exception:
+            return False
+        if error:
+            return False
+    if underlying not in _OWNER_GROUP_SAME_THREAD_TOOLS:
+        return False
+    current = str(_current_thread() or "")
+    asked = str((call_args or {}).get("thread_id") or "").strip() if isinstance(call_args, dict) else ""
+    return bool(current) and asked in ("", current)
+
+
 def _member_may_call(name: str, args: Any) -> bool:
     if name in _PUBLIC_TOOL_NAMES or name in _TOOL_SEARCH_READS:
         return True
@@ -3226,61 +3555,205 @@ def _is_mcp_tool(name: str) -> Optional[bool]:
     except Exception:
         return None
 
-def guard_member_tool_call(tool_name: str = "", args: Any = None, **_kw) -> Optional[Dict[str, str]]:
+# =====================================================================
+#  Cổng bộ nhớ — memory của chủ nhân chỉ sống trong tin nhắn riêng
+# =====================================================================
+#
+# Hermes tắt toolset `memory` cho phiên nhóm nhưng vẫn prefetch memory ngoài
+# (agentmemory) và chèn khối <memory-context> vào lượt — log còn ghi "provider
+# tools and system-prompt block are both withheld". Đo ngày 23/09: lượt của chủ
+# nhân trong một nhóm alert nhận ghi chú phiên dev ("Added SessionExpiryTests…")
+# rồi đem chúng khuyên cả nhóm. Chiều ngược lại cũng hở: sync_all ghi tin trong
+# nhóm vào memory của chủ nhân, để lần sau nó hiện ra ở nơi khác.
+#
+# Chỉ lượt Zalo mới bị xét. Không có lượt Zalo (CLI, cron của chủ nhân) thì để
+# nguyên hành vi của Hermes.
+
+_MEMORY_GATED = ("prefetch_all", "queue_prefetch_all", "sync_all", "on_turn_start")
+
+
+def _memory_allowed() -> bool:
+    turn = _TURN.get()
+    if not turn:
+        return True
+    return bool(_owner_dm(turn) and not turn.get("cron_job_id") and not _outsider_spoke_after(turn))
+
+
+def install_memory_gate(manager_cls=None) -> bool:
+    """Bọc các lối đọc/ghi memory của MemoryManager. Gọi nhiều lần vẫn an toàn."""
+    if manager_cls is None:
+        try:
+            from agent.memory_manager import MemoryManager as manager_cls
+        except Exception:
+            logger.warning("[zalo] không cài được cổng bộ nhớ: thiếu MemoryManager")
+            return False
+    for name in _MEMORY_GATED:
+        original = getattr(manager_cls, name, None)
+        if original is None or getattr(original, "_zalo_gated", False):
+            continue
+        empty = "" if name == "prefetch_all" else None
+
+        def gated(self, *args, __original=original, __name=name, __empty=empty, **kwargs):
+            if not _memory_allowed():
+                logger.info("[zalo] bỏ %s — lượt không phải tin riêng của chủ nhân", __name)
+                return __empty
+            return __original(self, *args, **kwargs)
+
+        gated._zalo_gated = True
+        gated.__name__ = name
+        setattr(manager_cls, name, gated)
+    return True
+
+
+_AUTHZ_LOGGER: Optional[logging.Logger] = None
+_AUTHZ_LOG_LOCK = threading.Lock()
+_AUTHZ_LOG_MAX_BYTES = 5 * 1024 * 1024
+_AUTHZ_LOG_BACKUPS = 3
+
+
+def _authz_log_enabled() -> bool:
+    return str(os.getenv("ZALO_AUTHZ_LOG", "1")).strip().lower() not in {"0", "false", "no", "off"}
+
+
+def _authz_log_path() -> Path:
+    home = os.getenv("HERMES_HOME") or os.path.expanduser("~/.hermes")
+    return Path(home) / "logs" / "zalo-authz.jsonl"
+
+
+def _authz_logger() -> Optional[logging.Logger]:
+    global _AUTHZ_LOGGER
+    with _AUTHZ_LOG_LOCK:
+        if _AUTHZ_LOGGER is None:
+            from logging.handlers import RotatingFileHandler
+
+            path = _authz_log_path()
+            path.parent.mkdir(parents=True, exist_ok=True)
+            handler = RotatingFileHandler(path, maxBytes=_AUTHZ_LOG_MAX_BYTES,
+                                          backupCount=_AUTHZ_LOG_BACKUPS, encoding="utf-8")
+            handler.setFormatter(logging.Formatter("%(message)s"))
+            log = logging.getLogger("zalo.authz")
+            log.propagate = False
+            log.setLevel(logging.INFO)
+            log.addHandler(handler)
+            _AUTHZ_LOGGER = log
+        return _AUTHZ_LOGGER
+
+
+def _authz_record(turn: Dict[str, Any], tool: str, verdict: Optional[Dict[str, str]],
+                  reason: str, kw: Dict[str, Any]) -> None:
+    """Một dòng JSON cho mỗi quyết định của guard, kể cả lượt được cho qua.
+
+    Chỉ ghi nhãn: không tham số, không nội dung tin, không path, không UID hay
+    thread id. Đủ để đếm theo vai × quyết định × lý do; không đủ để lần lại ai
+    đã nói gì.
+    """
+    if not _authz_log_enabled():
+        return
+    if turn.get("cron_job_id"):
+        chat = "cron"
+    else:
+        chat = "group" if turn.get("is_group") else "dm"
+    if turn.get("is_owner"):
+        role = "owner"
+    elif turn.get("audience") == "guest":
+        role = "guest"
+    else:
+        role = "public"
+    entry = {
+        "ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "session_id": str(kw.get("session_id") or ""),
+        "tool_call_id": str(kw.get("tool_call_id") or ""),
+        "role": role,
+        "chat": chat,
+        "tool": tool,
+        "decision": "block" if verdict else "allow",
+        "reason": reason,
+    }
+    try:
+        log = _authz_logger()
+        if log is not None:
+            log.info(json.dumps(entry, ensure_ascii=False))
+    except Exception as exc:  # log hỏng không được làm hỏng lượt chat
+        logger.warning("[zalo] không ghi được log quyết định: %s", exc)
+
+
+def guard_member_tool_call(tool_name: str = "", args: Any = None, **kw) -> Optional[Dict[str, str]]:
     """Execution boundary for every Zalo turn; non-Zalo callers are untouched."""
     turn = _TURN.get()
     if not turn:
         return None
-    name = str(tool_name or "")
+    verdict, reason, tool = _guard_decision(turn, str(tool_name or ""), args)
+    _authz_record(turn, tool, verdict, reason, kw)
+    return verdict
+
+
+def _guard_decision(turn: Dict[str, Any], name: str, args: Any) -> tuple:
+    """Trả về ``(verdict, reason, tool)``: verdict None là cho qua, reason là mã ngắn."""
     resolved = _resolved_tool_name(name, args)
-    owner_dm = bool(turn.get("is_owner") and not turn.get("is_group") and not _outsider_spoke_after(turn))
+    tool = resolved or name
+    owner_dm = _owner_dm(turn) and not _outsider_spoke_after(turn)
     if resolved is None:
         # The progressive tool bridge validates its own payload before dispatch. Let
         # an owner DM reach that validator so malformed calls get its actionable
         # schema error; non-owner and group turns remain fail-closed.
         if name == "tool_call" and owner_dm:
-            return None
+            return None, "owner_dm_unresolved", tool
         logger.warning("[zalo] generic core action denied")
+        # Vẫn chặn, nhưng một tool_call hỏng hình dạng (gộp nhiều lệnh, `calls`
+        # là chuỗi) phải nói được vì sao. "Không khả dụng" trơn khiến model tưởng
+        # tool bị cấm: lượt 23/09 nó tạo trùng ba lời nhắc rồi không xoá được vì
+        # cứ gộp ba lệnh xoá vào một tool_call.
+        problem = _tool_call_problem(args) if name == "tool_call" else None
         return {
             "action": "block",
-            "message": "Hành động này không khả dụng qua Zalo.",
-        }
+            "message": (
+                f"tool_call không chạy: {problem} Gọi mỗi công cụ bằng một tool_call riêng."
+                if problem else "Hành động này không khả dụng qua Zalo."
+            ),
+        }, "unresolved", tool
     if resolved in ZALO_DENIED_CORE_TOOLS:
         logger.warning("[zalo] generic core action denied")
         return {
             "action": "block",
             "message": "Hành động này không khả dụng qua Zalo.",
-        }
+        }, "denied_core", tool
     mcp_tool = _is_mcp_tool(resolved)
     if mcp_tool is None:
         logger.warning("[zalo] cannot classify tool while enforcing MCP boundary: %s", resolved)
         return {
             "action": "block",
             "message": "Hành động này không khả dụng qua Zalo.",
-        }
+        }, "unclassified", tool
     if mcp_tool:
         if owner_dm:
-            return None
+            return None, "owner_dm", tool
         logger.warning("[zalo] MCP tool denied outside owner direct message: %s", resolved)
         return {
             "action": "block",
             "message": "MCP chỉ khả dụng trong tin nhắn riêng của chủ nhân.",
-        }
+        }, "mcp_outside_dm", tool
     if owner_dm:
-        return None
+        return None, "owner_dm", tool
+    if _owner_group_may_call(turn, name, args):
+        return None, "owner_group_same_thread", tool
     if _member_may_call(name, args):
-        return None
+        return None, "public_tool", tool
     logger.warning("[zalo] chặn %s — lượt không phải của riêng chủ nhân", name)
-    reason = ("lượt của chủ nhân nhưng có tin người khác chen vào"
-              if turn.get("is_owner") or turn.get("core_tools")
-              else "lượt này do người trong nhóm gửi")
+    # Lý do phải đúng sự thật: lượt 23/09 của chủ nhân trong nhóm nhận "có tin người
+    # khác chen vào" dù không ai chen, và model đi đoán nguyên nhân sai.
+    if not (turn.get("is_owner") or turn.get("core_tools")):
+        reason, code = "lượt này do người trong nhóm gửi", "not_owner"
+    elif turn.get("is_group"):
+        reason, code = "lượt này ở trong nhóm, không phải tin nhắn riêng", "owner_in_group"
+    else:
+        reason, code = "lượt của chủ nhân nhưng có tin người khác chen vào", "outsider_spoke"
     return {
         "action": "block",
         "message": (f"Công cụ {name} chỉ dùng được trong lượt của riêng chủ nhân ({reason}). "
                     "Cần tra tài liệu thì dùng zalo_kb_list rồi zalo_kb_read, cần gửi tệp thì "
                     "zalo_send_file, cần xem lại tin cũ thì zalo_read_history — tìm bằng "
                     "tool_search nếu chưa thấy. Đừng gọi lại công cụ này."),
-    }
+    }, code, tool
 
 
 def define_platform_composite() -> None:
